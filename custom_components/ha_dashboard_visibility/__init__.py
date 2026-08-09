@@ -26,6 +26,7 @@ import voluptuous as vol
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.components import websocket_api
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.helpers.storage import Store
 
@@ -49,8 +50,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Dashboard Visibility Manager from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    await _async_register_static_path(hass)
-    await _async_register_lovelace_resource(hass)
+    _async_register_card(hass)
 
     websocket_api.async_register_command(hass, websocket_get_data)
     websocket_api.async_register_command(hass, websocket_set_hidden)
@@ -64,48 +64,41 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-async def _async_register_static_path(hass: HomeAssistant) -> None:
-    """Serve the card's JavaScript file."""
-    frontend_dir = Path(__file__).parent / "frontend"
-    await hass.http.async_register_static_paths(
-        [StaticPathConfig(STATIC_URL_BASE, str(frontend_dir), cache_headers=False)]
-    )
+@callback
+def _async_register_card(hass: HomeAssistant) -> None:
+    """Serve the card's JS and register it as a Lovelace resource.
 
-
-async def _async_register_lovelace_resource(hass: HomeAssistant) -> None:
-    """Make sure the card's JS module is registered as a Lovelace resource.
-
-    Written directly to the lovelace_resources storage so it works
-    regardless of whether dashboards are in storage or YAML mode, and
-    without requiring the user to add the resource manually via
-    Settings -> Dashboards -> Resources.
+    Same pattern as ha-parcel-tracking: static path + resource-store
+    write happen together in one deferred function, either right away
+    (task) if HA is already fully running, or once EVENT_HOMEASSISTANT_STARTED
+    fires (during a normal boot, config entries are set up before HA
+    reaches the "running" state, so the module wouldn't be picked up by
+    Lovelace's already-loaded resource collection otherwise).
     """
-    url = f"{STATIC_URL_BASE}/{CARD_FILENAME}"
-    store: Store = Store(
-        hass, LOVELACE_RESOURCES_STORAGE_VERSION, LOVELACE_RESOURCES_STORAGE_KEY
-    )
-    data = await store.async_load()
-    if data is None:
-        data = {"items": []}
-    items = data.setdefault("items", [])
+    static_url = f"{STATIC_URL_BASE}/{CARD_FILENAME}"
+    js_path = Path(__file__).parent / "frontend" / CARD_FILENAME
 
-    if any(item.get("url") == url for item in items):
-        return
+    async def _register(_event: Any = None) -> None:
+        try:
+            await hass.http.async_register_static_paths(
+                [StaticPathConfig(static_url, str(js_path), cache_headers=False)]
+            )
+        except RuntimeError:
+            pass  # Route bereits registriert (z. B. nach Reload)
 
-    next_id = str(
-        max((int(item["id"]) for item in items if str(item.get("id", "")).isdigit()), default=0)
-        + 1
-    )
-    items.append({"id": next_id, "type": "module", "url": url})
-
-    async def _register_when_ready(*_: Any) -> None:
-        await store.async_save(data)
-        _LOGGER.debug("Registered Lovelace resource %s", url)
+        store = Store(hass, LOVELACE_RESOURCES_STORAGE_VERSION, LOVELACE_RESOURCES_STORAGE_KEY)
+        data = await store.async_load() or {"items": [], "deleted_items": []}
+        if not any(r.get("url") == static_url for r in data.get("items", [])):
+            data.setdefault("items", []).append(
+                {"id": "ha_dashboard_visibility_card", "type": "module", "url": static_url}
+            )
+            await store.async_save(data)
+            _LOGGER.info("Dashboard-Visibility-Karte als Lovelace-Ressource registriert.")
 
     if hass.state is CoreState.running:
-        await _register_when_ready()
+        hass.async_create_task(_register())
     else:
-        hass.bus.async_listen_once("homeassistant_started", _register_when_ready)
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register)
 
 
 def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
