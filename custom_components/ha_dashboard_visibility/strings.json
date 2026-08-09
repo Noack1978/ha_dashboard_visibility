@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Dashboard Visibility Manager einrichten",
+        "description": "Fügt eine Karte hinzu, mit der ein Admin pro Benutzer steuern kann, welche Dashboards in dessen Sidebar sichtbar sind. Es ist keine weitere Konfiguration nötig."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Es kann nur eine Instanz dieser Integration eingerichtet werden."
+    }
+  }
+}

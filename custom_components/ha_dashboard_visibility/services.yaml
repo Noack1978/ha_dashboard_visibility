@@ -1,0 +1,2 @@
+# Dashboard Visibility Manager exposes no services.
+# All interaction happens via the Lovelace card (websocket API).
