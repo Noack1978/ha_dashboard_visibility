@@ -1,0 +1,13 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Set up Dashboard Visibility Manager",
+        "description": "Adds a card that lets an admin control, per user, which dashboards appear in that user's sidebar. No further configuration is needed."
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only one instance of this integration can be set up."
+    }
+  }
+}
