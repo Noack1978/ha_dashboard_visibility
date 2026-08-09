@@ -4,23 +4,33 @@ Provides a Lovelace card that lets an admin control, per user, which
 dashboards show up in that user's sidebar - without having to log in
 as that user or open per-view visibility dialogs one by one.
 
-Technical approach: dashboards that are registered as frontend panels
-of component "lovelace" are listed. For each (user, dashboard) pair we
-read/write via async_user_store() from
+Card/resource registration follows the "Developer Guide: Embedded
+Lovelace Card in a Home Assistant Integration" pattern: registration
+happens once in async_setup() (not async_setup_entry), and the
+Lovelace resource is written through the REAL, running lovelace
+object (hass.data["lovelace"].resources) rather than a separate,
+raw Store("lovelace_resources") instance. Lovelace's own
+ResourceStorageCollection is lazy-loaded; writing to a second, raw
+Store for the same storage key can race with it and get silently
+overwritten once the real collection saves its own (stale) in-memory
+state. Going through resources.async_create_item()/async_update_item()
+avoids that entirely.
+
+Per-user sidebar visibility (which dashboards are hidden for whom) is
+read/written via async_user_store() from
 homeassistant.components.frontend.storage - the exact same cached
 per-user store Home Assistant's own frontend uses for the "Change
 order and hide items from the sidebar" feature in the user profile
 (data key "sidebar" -> {"panelOrder": [...], "hiddenPanels": [...]}).
-Going through this function (rather than reading/writing the backing
-Store file directly) matters: HA keeps a per-user UserStore cached in
-memory once it's been loaded, and a raw file write would be invisible
-to a running instance until that cache is evicted. Using
-async_user_store() updates the live cache too, so changes take effect
-immediately, no restart required, and stay fully compatible with HA's
-native per-user sidebar customisation.
+HA keeps a per-user UserStore cached in memory once loaded; a raw
+file write to frontend.user_data_{user_id} would be invisible to a
+running instance until that cache is evicted (effectively: until the
+next HA restart). async_user_store() updates the live cache too, so
+changes take effect immediately.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -32,8 +42,9 @@ from homeassistant.components import websocket_api
 from homeassistant.components.frontend.storage import async_user_store
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import CoreState, HomeAssistant, callback
-from homeassistant.helpers.storage import Store
+from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.typing import ConfigType
 
 from .const import (
     CARD_FILENAME,
@@ -45,19 +56,22 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
-LOVELACE_RESOURCES_STORAGE_KEY = "lovelace_resources"
-LOVELACE_RESOURCES_STORAGE_VERSION = 1
+RESOURCE_RETRY_SECONDS = 5
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the integration (runs once, regardless of config entries)."""
+    await _async_register_card(hass)
+
+    websocket_api.async_register_command(hass, websocket_get_data)
+    websocket_api.async_register_command(hass, websocket_set_hidden)
+
+    return True
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Dashboard Visibility Manager from a config entry."""
     hass.data.setdefault(DOMAIN, {})
-
-    _async_register_card(hass)
-
-    websocket_api.async_register_command(hass, websocket_get_data)
-    websocket_api.async_register_command(hass, websocket_set_hidden)
-
     return True
 
 
@@ -67,41 +81,71 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return True
 
 
-@callback
-def _async_register_card(hass: HomeAssistant) -> None:
+def _read_manifest_version() -> str:
+    """Read the version from manifest.json (sync, run in executor)."""
+    manifest_path = Path(__file__).parent / "manifest.json"
+    try:
+        with manifest_path.open(encoding="utf-8") as f:
+            return json.load(f).get("version", "0")
+    except (OSError, json.JSONDecodeError):
+        return "0"
+
+
+async def _async_register_card(hass: HomeAssistant) -> None:
     """Serve the card's JS and register it as a Lovelace resource.
 
-    Same pattern as ha-parcel-tracking: static path + resource-store
-    write happen together in one deferred function, either right away
-    (task) if HA is already fully running, or once EVENT_HOMEASSISTANT_STARTED
-    fires (during a normal boot, config entries are set up before HA
-    reaches the "running" state, so the module wouldn't be picked up by
-    Lovelace's already-loaded resource collection otherwise).
+    Static path registration happens immediately (idempotent via
+    try/except RuntimeError). The Lovelace resource registration is
+    deferred until the real lovelace object's resource collection has
+    finished loading, since it's lazy-loaded and not necessarily ready
+    yet when async_setup() runs.
     """
-    static_url = f"{STATIC_URL_BASE}/{CARD_FILENAME}"
     js_path = Path(__file__).parent / "frontend" / CARD_FILENAME
+    resource_url_base = f"{STATIC_URL_BASE}/{CARD_FILENAME}"
 
-    async def _register(_event: Any = None) -> None:
-        try:
-            await hass.http.async_register_static_paths(
-                [StaticPathConfig(static_url, str(js_path), cache_headers=False)]
-            )
-        except RuntimeError:
-            pass  # Route bereits registriert (z. B. nach Reload)
+    try:
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(resource_url_base, str(js_path), cache_headers=False)]
+        )
+    except RuntimeError:
+        pass  # Route bereits registriert (z. B. nach Reload)
 
-        store = Store(hass, LOVELACE_RESOURCES_STORAGE_VERSION, LOVELACE_RESOURCES_STORAGE_KEY)
-        data = await store.async_load() or {"items": [], "deleted_items": []}
-        if not any(r.get("url") == static_url for r in data.get("items", [])):
-            data.setdefault("items", []).append(
-                {"id": "ha_dashboard_visibility_card", "type": "module", "url": static_url}
-            )
-            await store.async_save(data)
+    version = await hass.async_add_executor_job(_read_manifest_version)
+    resource_url = f"{resource_url_base}?v={version}"
+
+    async def _register_resource(_now: Any = None) -> None:
+        lovelace = hass.data.get("lovelace")
+        if lovelace is None or getattr(lovelace, "mode", None) != "storage":
+            # YAML-Modus: keine Auto-Registrierung möglich, User muss die
+            # Ressource manuell im Dashboard-YAML eintragen.
+            return
+
+        resources = lovelace.resources
+        if not resources.loaded:
+            async_call_later(hass, RESOURCE_RETRY_SECONDS, _register_resource)
+            return
+
+        existing = next(
+            (
+                item
+                for item in resources.async_items()
+                if item["url"].split("?")[0] == resource_url_base
+            ),
+            None,
+        )
+        if existing is None:
+            await resources.async_create_item({"res_type": "module", "url": resource_url})
             _LOGGER.info("Dashboard-Visibility-Karte als Lovelace-Ressource registriert.")
+        elif existing["url"] != resource_url:
+            await resources.async_update_item(
+                existing["id"], {"res_type": "module", "url": resource_url}
+            )
+            _LOGGER.info("Dashboard-Visibility-Karte auf Version %s aktualisiert.", version)
 
     if hass.state is CoreState.running:
-        hass.async_create_task(_register())
+        hass.async_create_task(_register_resource())
     else:
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register)
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_resource)
 
 
 def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
