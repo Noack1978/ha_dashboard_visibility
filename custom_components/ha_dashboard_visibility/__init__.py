@@ -6,14 +6,18 @@ as that user or open per-view visibility dialogs one by one.
 
 Technical approach: dashboards that are registered as frontend panels
 of component "lovelace" are listed. For each (user, dashboard) pair we
-read/write the SAME storage Home Assistant's own frontend uses for the
-"Change order and hide items from the sidebar" feature in the user
-profile (storage key "frontend.user_data_{user_id}", data key
-"sidebar" -> {"panelOrder": [...], "hiddenPanels": [...]}). This means
-changes take effect immediately (next sidebar refresh / reload), no
-restart required, and stay fully compatible with HA's native per-user
-sidebar customisation - our card and the native profile editor are
-just two doors into the same room.
+read/write via async_user_store() from
+homeassistant.components.frontend.storage - the exact same cached
+per-user store Home Assistant's own frontend uses for the "Change
+order and hide items from the sidebar" feature in the user profile
+(data key "sidebar" -> {"panelOrder": [...], "hiddenPanels": [...]}).
+Going through this function (rather than reading/writing the backing
+Store file directly) matters: HA keeps a per-user UserStore cached in
+memory once it's been loaded, and a raw file write would be invisible
+to a running instance until that cache is evicted. Using
+async_user_store() updates the live cache too, so changes take effect
+immediately, no restart required, and stay fully compatible with HA's
+native per-user sidebar customisation.
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ import voluptuous as vol
 
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.components import websocket_api
+from homeassistant.components.frontend.storage import async_user_store
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CoreState, HomeAssistant, callback
@@ -33,8 +38,6 @@ from homeassistant.helpers.storage import Store
 from .const import (
     CARD_FILENAME,
     DOMAIN,
-    FRONTEND_USER_DATA_KEY_FMT,
-    FRONTEND_USER_DATA_VERSION,
     LOVELACE_COMPONENT_NAME,
     SIDEBAR_USER_DATA_KEY,
     STATIC_URL_BASE,
@@ -120,17 +123,20 @@ def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
     return dashboards
 
 
-def _sidebar_store(hass: HomeAssistant, user_id: str) -> Store:
-    key = FRONTEND_USER_DATA_KEY_FMT.format(user_id=user_id)
-    return Store(hass, FRONTEND_USER_DATA_VERSION, key)
-
-
 async def _async_get_hidden_panels(hass: HomeAssistant, user_id: str) -> list[str]:
-    store = _sidebar_store(hass, user_id)
-    data = await store.async_load()
-    if not data:
-        return []
-    sidebar = data.get(SIDEBAR_USER_DATA_KEY) or {}
+    """Read hiddenPanels via HA's own cached UserStore (not a raw file read).
+
+    Home Assistant keeps a per-user in-memory cache (UserStore, populated
+    the first time anything - including the user's own browser - reads
+    or writes their frontend user data). Reading the file directly on
+    disk would miss any change that only exists in that cache, and
+    writing directly to the file would be invisible to the running
+    instance until the cache is evicted (effectively: until next HA
+    restart). Going through async_user_store() guarantees we see/update
+    the exact same data the frontend itself uses.
+    """
+    store = await async_user_store(hass, user_id)
+    sidebar = store.data.get(SIDEBAR_USER_DATA_KEY) or {}
     hidden = sidebar.get("hiddenPanels")
     if isinstance(hidden, list):
         return list(hidden)
@@ -144,13 +150,14 @@ async def _async_set_hidden_panel(
 
     Only touches hiddenPanels - panelOrder and any other keys already
     stored for the user (including other, unrelated frontend user_data
-    such as onboarding flags) are preserved as-is.
+    such as onboarding flags) are preserved as-is. Uses async_user_store()
+    so the change is written through HA's own cache: it takes effect
+    immediately for a connected client (via the store's subscription
+    mechanism) and is correctly seen on the next sidebar load, instead of
+    only reaching the file on disk.
     """
-    store = _sidebar_store(hass, user_id)
-    data = await store.async_load()
-    if not isinstance(data, dict):
-        data = {}
-    sidebar = dict(data.get(SIDEBAR_USER_DATA_KEY) or {})
+    store = await async_user_store(hass, user_id)
+    sidebar = dict(store.data.get(SIDEBAR_USER_DATA_KEY) or {})
     hidden_panels = list(sidebar.get("hiddenPanels") or [])
 
     if hidden and url_path not in hidden_panels:
@@ -162,8 +169,7 @@ async def _async_set_hidden_panel(
 
     sidebar["hiddenPanels"] = hidden_panels
     sidebar.setdefault("panelOrder", [])
-    data[SIDEBAR_USER_DATA_KEY] = sidebar
-    await store.async_save(data)
+    await store.async_set_item(SIDEBAR_USER_DATA_KEY, sidebar)
 
 
 @websocket_api.websocket_command({"type": f"{DOMAIN}/get_data"})
