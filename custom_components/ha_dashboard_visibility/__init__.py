@@ -176,7 +176,13 @@ def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
     group entries and show what kind of panel each one is.
     """
     panels: dict[str, Any] = hass.data.get("frontend_panels", {})
-    excluded_url_paths = {"notfound"}
+    excluded_url_paths = {
+        "notfound",  # 404-Fallback, nie sinnvoll in der Sidebar
+        "profile",  # eigenes Profil, immer über Avatar erreichbar, kein echtes Dashboard
+        "_my_redirect",  # technischer Weiterleitungs-Mechanismus (my.home-assistant.io), keine eigene Seite
+        "config",  # Häkchen hat keine Auswirkung auf die Sichtbarkeit (von Mirko bestätigt)
+        "app",  # "App"-Eintrag, Häkchen hat keine Auswirkung auf die Sichtbarkeit (von Mirko bestätigt)
+    }
     dashboards = []
     for url_path, panel in panels.items():
         if url_path in excluded_url_paths:
