@@ -44,7 +44,11 @@ class DashboardVisibilityCard extends HTMLElement {
         table { border-collapse: collapse; width: 100%; }
         th, td { padding: 8px 12px; text-align: center; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
         th { font-weight: 500; color: var(--secondary-text-color); white-space: nowrap; }
-        td.dashboard-name { text-align: left; white-space: nowrap; color: var(--primary-text-color); }
+        td.dashboard-name { text-align: left; white-space: nowrap; color: var(--primary-text-color); vertical-align: middle; }
+        td.dashboard-name ha-icon { vertical-align: middle; }
+        .name-block { display: inline-flex; flex-direction: column; vertical-align: middle; }
+        .path-hint { font-style: italic; font-size: 0.75em; color: var(--secondary-text-color); }
+        tr.group-row td { text-align: left; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em; font-size: 0.8em; color: var(--secondary-text-color); background: var(--secondary-background-color, rgba(127,127,127,0.08)); border-bottom: none; padding-top: 14px; }
         .hint { color: var(--secondary-text-color); font-size: 0.9em; margin: 0 0 8px; }
         input[type="checkbox"] { width: 20px; height: 20px; cursor: pointer; }
         .error { color: var(--error-color, red); }
@@ -83,15 +87,26 @@ class DashboardVisibilityCard extends HTMLElement {
       return;
     }
 
-    let html = `<p class="hint">Häkchen = Eintrag ist für diesen Benutzer in der Sidebar sichtbar.</p>`;
+    let html = `<p class="hint">Häkchen = Eintrag ist für diesen Benutzer in der Sidebar sichtbar. Kursiv unter dem Namen: technischer Pfad (url_path) und Panel-Typ (component_name) – zur Einordnung, was ein Eintrag eigentlich ist.</p>`;
     html += `<table><thead><tr><th style="text-align:left;">Dashboard / Panel</th>`;
     for (const user of this._users) {
       html += `<th>${this._escape(user.name)}${user.is_admin ? " (Admin)" : ""}</th>`;
     }
     html += `</tr></thead><tbody>`;
 
+    let currentGroup = null;
     for (const dash of this._dashboards) {
-      html += `<tr><td class="dashboard-name">${dash.icon ? `<ha-icon icon="${dash.icon}" style="margin-right:6px;"></ha-icon>` : ""}${this._escape(dash.title)}</td>`;
+      const group = dash.component_name || "(ohne component_name)";
+      if (group !== currentGroup) {
+        currentGroup = group;
+        const colspan = 1 + this._users.length;
+        html += `<tr class="group-row"><td colspan="${colspan}">${this._escape(group)}</td></tr>`;
+      }
+
+      html += `<tr><td class="dashboard-name">`;
+      html += `${dash.icon ? `<ha-icon icon="${dash.icon}" style="margin-right:6px;"></ha-icon>` : ""}`;
+      html += `<div class="name-block"><span>${this._escape(dash.title)}</span>`;
+      html += `<span class="path-hint">${this._escape(dash.url_path)}</span></div></td>`;
       for (const user of this._users) {
         const hidden = !!(this._matrix[user.id] && this._matrix[user.id][dash.url_path]);
         const checked = !hidden;

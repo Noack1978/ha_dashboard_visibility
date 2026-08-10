@@ -168,10 +168,12 @@ def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
 
     This includes user-created Lovelace dashboards as well as panels
     registered by integrations (e.g. Energy, Map, Calendar, To-do,
-    Settings) - anything with show_in_sidebar True, since that's the
-    same flag HA's own sidebar uses to decide what CAN appear there at
-    all. A handful of purely technical panels that are never meant to
-    show up (like the 404 fallback panel) are excluded explicitly.
+    Settings) and add-on/ingress panels - anything with show_in_sidebar
+    True, since that's the same flag HA's own sidebar uses to decide
+    what CAN appear there at all. A handful of purely technical panels
+    that are never meant to show up (like the 404 fallback panel) are
+    excluded explicitly. component_name is included so the card can
+    group entries and show what kind of panel each one is.
     """
     panels: dict[str, Any] = hass.data.get("frontend_panels", {})
     excluded_url_paths = {"notfound"}
@@ -187,9 +189,10 @@ def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
                 "title": _panel_display_title(url_path, panel),
                 "icon": panel.sidebar_icon,
                 "require_admin": panel.require_admin,
+                "component_name": getattr(panel, "component_name", "") or "",
             }
         )
-    dashboards.sort(key=lambda d: d["title"].lower())
+    dashboards.sort(key=lambda d: (d["component_name"], d["title"].lower()))
     return dashboards
 
 
