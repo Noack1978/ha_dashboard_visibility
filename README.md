@@ -62,9 +62,20 @@ automatisch alle Dashboards und Benutzer und zeigt die aktuelle Sichtbarkeit.
 
 ## Grenzen
 
-- Zeigt nur Dashboards, die als Panel vom Typ `lovelace` registriert sind
-  (also reguläre Dashboards; keine Custom-Panels/iframe-Panels)
+- Zeigt alle Panels, die HA selbst als sidebar-fähig markiert
+  (`show_in_sidebar: true`) – also eigene Dashboards, Integrations-Panels
+  (z. B. Energie, Karte, Kalender, To-do) und Add-on-/Ingress-Panels
+  (z. B. Terminal, File editor, HACS). Rein technische Einträge ohne
+  eigenständigen Sidebar-Nutzen sind fest ausgeschlossen: `notfound`
+  (404-Fallback), `profile` (immer über den Avatar erreichbar), `_my_redirect`
+  (technischer Weiterleitungs-Mechanismus), `config` und `app` (Häkchen ohne
+  Auswirkung auf die Sichtbarkeit, bestätigt getestet)
+- Einträge werden nach `component_name` gruppiert; unter jedem Namen steht
+  klein und kursiv der technische `url_path` zur Einordnung
 - Sichtbarkeit wirkt sofort, aber der Benutzer sieht die Änderung erst
   nach einem Sidebar-/Seiten-Reload
+- Bei manchen Add-on-/Ingress-Panels ist nicht in jedem Fall verifiziert,
+  ob das Ausblenden genauso zuverlässig greift wie bei regulären
+  Dashboards – im Zweifel selbst gegentesten
 - Kein visueller Karten-Editor (nur YAML-Konfiguration, siehe oben) – ist
   aber wegen fehlender Optionen auch nicht nötig
