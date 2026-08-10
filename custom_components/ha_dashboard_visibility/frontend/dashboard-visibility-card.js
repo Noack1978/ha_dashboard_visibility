@@ -33,7 +33,7 @@ class DashboardVisibilityCard extends HTMLElement {
 
     const root = this.attachShadow ? this.shadowRoot || this.attachShadow({ mode: "open" }) : this;
     root.innerHTML = `
-      <ha-card header="Dashboard-Sichtbarkeit pro Benutzer">
+      <ha-card header="Sichtbarkeit pro Benutzer (Dashboards & Panels)">
         <div class="card-content" id="content">
           <p>Lade Daten ...</p>
         </div>
@@ -83,8 +83,8 @@ class DashboardVisibilityCard extends HTMLElement {
       return;
     }
 
-    let html = `<p class="hint">Häkchen = Dashboard ist für diesen Benutzer in der Sidebar sichtbar.</p>`;
-    html += `<table><thead><tr><th style="text-align:left;">Dashboard</th>`;
+    let html = `<p class="hint">Häkchen = Eintrag ist für diesen Benutzer in der Sidebar sichtbar.</p>`;
+    html += `<table><thead><tr><th style="text-align:left;">Dashboard / Panel</th>`;
     for (const user of this._users) {
       html += `<th>${this._escape(user.name)}${user.is_admin ? " (Admin)" : ""}</th>`;
     }

@@ -49,7 +49,6 @@ from homeassistant.helpers.typing import ConfigType
 from .const import (
     CARD_FILENAME,
     DOMAIN,
-    LOVELACE_COMPONENT_NAME,
     SIDEBAR_USER_DATA_KEY,
     STATIC_URL_BASE,
 )
@@ -148,17 +147,44 @@ async def _async_register_card(hass: HomeAssistant) -> None:
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_resource)
 
 
+def _panel_display_title(url_path: str, panel: Any) -> str:
+    """Return a human-friendly title for a panel.
+
+    Built-in system panels and some auto-generated dashboards don't
+    always have a sidebar_title set (HA's frontend fills in a
+    localized label at display time instead). Without a translation
+    layer available here, fall back to something more readable than
+    the raw url_path.
+    """
+    if panel.sidebar_title:
+        return panel.sidebar_title
+    if url_path == "lovelace":
+        return "Übersicht (Standard-Dashboard)"
+    return url_path.replace("-", " ").replace("_", " ").title()
+
+
 def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
-    """Return all dashboards registered as lovelace frontend panels."""
+    """Return all panels that Home Assistant considers sidebar-eligible.
+
+    This includes user-created Lovelace dashboards as well as panels
+    registered by integrations (e.g. Energy, Map, Calendar, To-do,
+    Settings) - anything with show_in_sidebar True, since that's the
+    same flag HA's own sidebar uses to decide what CAN appear there at
+    all. A handful of purely technical panels that are never meant to
+    show up (like the 404 fallback panel) are excluded explicitly.
+    """
     panels: dict[str, Any] = hass.data.get("frontend_panels", {})
+    excluded_url_paths = {"notfound"}
     dashboards = []
     for url_path, panel in panels.items():
-        if getattr(panel, "component_name", None) != LOVELACE_COMPONENT_NAME:
+        if url_path in excluded_url_paths:
+            continue
+        if not getattr(panel, "show_in_sidebar", True):
             continue
         dashboards.append(
             {
                 "url_path": url_path,
-                "title": panel.sidebar_title or url_path,
+                "title": _panel_display_title(url_path, panel),
                 "icon": panel.sidebar_icon,
                 "require_admin": panel.require_admin,
             }
