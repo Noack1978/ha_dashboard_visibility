@@ -5,14 +5,24 @@ class DashboardVisibilityCard extends HTMLElement {
     this._dashboards = [];
     this._users = [];
     this._matrix = {};
+    this._config = {};
   }
 
   setConfig(config) {
     this._config = config || {};
+    // Wenn die Karte schon Daten geladen hat (z. B. Änderung im visuellen
+    // Editor), nur die Tabelle neu aufbauen statt alles neu zu laden.
+    if (this._initialized && this._content && this._dashboards.length) {
+      this._renderTable();
+    }
   }
 
   static getStubConfig() {
     return {};
+  }
+
+  static getConfigElement() {
+    return document.createElement("dashboard-visibility-card-editor");
   }
 
   getCardSize() {
@@ -26,6 +36,12 @@ class DashboardVisibilityCard extends HTMLElement {
       this._initialized = true;
       this._render();
     }
+  }
+
+  _visibleUsers() {
+    const selected = Array.isArray(this._config.users) ? this._config.users : null;
+    if (!selected) return this._users; // kein Filter gesetzt = alle anzeigen
+    return this._users.filter((u) => selected.includes(u.id));
   }
 
   async _render() {
@@ -82,14 +98,15 @@ class DashboardVisibilityCard extends HTMLElement {
       this._content.innerHTML = `<p>Keine Dashboards gefunden.</p>`;
       return;
     }
-    if (!this._users.length) {
-      this._content.innerHTML = `<p>Keine Benutzer gefunden.</p>`;
+    const visibleUsers = this._visibleUsers();
+    if (!visibleUsers.length) {
+      this._content.innerHTML = `<p>Keine Benutzer ausgewählt. Im Karten-Editor mindestens einen Benutzer aktivieren.</p>`;
       return;
     }
 
     let html = `<p class="hint">Häkchen = Eintrag ist für diesen Benutzer in der Sidebar sichtbar. Kursiv unter dem Namen: technischer Pfad (url_path) und Panel-Typ (component_name) – zur Einordnung, was ein Eintrag eigentlich ist.</p>`;
     html += `<table><thead><tr><th style="text-align:left;">Dashboard / Panel</th>`;
-    for (const user of this._users) {
+    for (const user of visibleUsers) {
       html += `<th>${this._escape(user.name)}${user.is_admin ? " (Admin)" : ""}</th>`;
     }
     html += `</tr></thead><tbody>`;
@@ -99,7 +116,7 @@ class DashboardVisibilityCard extends HTMLElement {
       const group = dash.component_name || "(ohne component_name)";
       if (group !== currentGroup) {
         currentGroup = group;
-        const colspan = 1 + this._users.length;
+        const colspan = 1 + visibleUsers.length;
         html += `<tr class="group-row"><td colspan="${colspan}">${this._escape(group)}</td></tr>`;
       }
 
@@ -107,7 +124,7 @@ class DashboardVisibilityCard extends HTMLElement {
       html += `${dash.icon ? `<ha-icon icon="${dash.icon}" style="margin-right:6px;"></ha-icon>` : ""}`;
       html += `<div class="name-block"><span>${this._escape(dash.title)}</span>`;
       html += `<span class="path-hint">${this._escape(dash.url_path)}</span></div></td>`;
-      for (const user of this._users) {
+      for (const user of visibleUsers) {
         const hidden = !!(this._matrix[user.id] && this._matrix[user.id][dash.url_path]);
         const checked = !hidden;
         html += `<td><input type="checkbox" data-user="${user.id}" data-dashboard="${dash.url_path}" ${checked ? "checked" : ""}></td>`;
@@ -162,5 +179,104 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: "dashboard-visibility-card",
   name: "Dashboard Visibility Card",
-  description: "Steuert pro Benutzer, welche Dashboards in der Sidebar sichtbar sind.",
+  description: "Steuert pro Benutzer, welche Dashboards/Panels in der Sidebar sichtbar sind.",
 });
+
+/**
+ * Visueller Editor: lässt einen Admin auswählen, welche Benutzer als
+ * Spalten angezeigt werden (Standard: alle). Reduziert die Breite der
+ * Karte, indem man nicht benötigte Benutzer-Spalten abwählt.
+ */
+class DashboardVisibilityCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this._initialized = false;
+    this._config = {};
+    this._users = [];
+  }
+
+  setConfig(config) {
+    this._config = config || {};
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._initialized) {
+      this._initialized = true;
+      this._renderAsync();
+    }
+  }
+
+  async _renderAsync() {
+    const root = this.attachShadow ? this.shadowRoot || this.attachShadow({ mode: "open" }) : this;
+    root.innerHTML = `
+      <div id="content"><p>Lade Benutzer ...</p></div>
+      <style>
+        .hint { color: var(--secondary-text-color); font-size: 0.9em; margin: 0 0 8px; }
+        .row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+        input[type="checkbox"] { width: 20px; height: 20px; cursor: pointer; }
+        .error { color: var(--error-color, red); }
+      </style>
+    `;
+    this._content = root.getElementById("content");
+
+    if (!this._hass.user || !this._hass.user.is_admin) {
+      this._content.innerHTML = `<p class="error">Nur für Administratoren editierbar.</p>`;
+      return;
+    }
+
+    try {
+      const result = await this._hass.callWS({ type: "ha_dashboard_visibility/get_data" });
+      this._users = result.users || [];
+      this._renderCheckboxes();
+    } catch (err) {
+      console.error("dashboard-visibility-card-editor: failed to load users", err);
+      this._content.innerHTML = `<p class="error">Benutzer konnten nicht geladen werden.</p>`;
+    }
+  }
+
+  _renderCheckboxes() {
+    if (!this._users.length) {
+      this._content.innerHTML = `<p>Keine Benutzer gefunden.</p>`;
+      return;
+    }
+    const selected = Array.isArray(this._config.users) ? this._config.users : null;
+
+    let html = `<p class="hint">Welche Benutzer sollen als Spalten in der Karte angezeigt werden? Standard: alle. Abwählen reduziert die Kartenbreite.</p>`;
+    for (const user of this._users) {
+      const checked = selected ? selected.includes(user.id) : true;
+      html += `<label class="row"><input type="checkbox" data-user="${user.id}" ${checked ? "checked" : ""}><span>${this._escape(user.name)}${user.is_admin ? " (Admin)" : ""}</span></label>`;
+    }
+    this._content.innerHTML = html;
+
+    this._content.querySelectorAll("input[type=checkbox]").forEach((cb) => {
+      cb.addEventListener("change", () => this._onChange());
+    });
+  }
+
+  _onChange() {
+    const checkboxes = Array.from(this._content.querySelectorAll("input[type=checkbox]"));
+    const selected = checkboxes.filter((cb) => cb.checked).map((cb) => cb.dataset.user);
+
+    const newConfig = { ...this._config };
+    if (selected.length === checkboxes.length) {
+      // alle ausgewählt = kein Filter, sauberer Default statt langer Liste
+      delete newConfig.users;
+    } else {
+      newConfig.users = selected;
+    }
+    this._config = newConfig;
+
+    this.dispatchEvent(
+      new CustomEvent("config-changed", { detail: { config: newConfig }, bubbles: true, composed: true })
+    );
+  }
+
+  _escape(str) {
+    const div = document.createElement("div");
+    div.textContent = str == null ? "" : String(str);
+    return div.innerHTML;
+  }
+}
+
+customElements.define("dashboard-visibility-card-editor", DashboardVisibilityCardEditor);

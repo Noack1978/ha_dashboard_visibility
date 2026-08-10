@@ -77,5 +77,7 @@ automatisch alle Dashboards und Benutzer und zeigt die aktuelle Sichtbarkeit.
 - Bei manchen Add-on-/Ingress-Panels ist nicht in jedem Fall verifiziert,
   ob das Ausblenden genauso zuverlässig greift wie bei regulären
   Dashboards – im Zweifel selbst gegentesten
-- Kein visueller Karten-Editor (nur YAML-Konfiguration, siehe oben) – ist
-  aber wegen fehlender Optionen auch nicht nötig
+- Visueller Karten-Editor zeigt Checkboxen zur Auswahl, welche Benutzer
+  als Spalten angezeigt werden (Standard: alle) – reduziert bei Bedarf
+  die Kartenbreite; steuert nur die Anzeige, ändert aber keine
+  Sichtbarkeits-Einstellungen selbst
