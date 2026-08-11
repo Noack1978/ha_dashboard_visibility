@@ -113,33 +113,71 @@ async def _async_register_card(hass: HomeAssistant) -> None:
     resource_url = f"{resource_url_base}?v={version}"
 
     async def _register_resource(_now: Any = None) -> None:
-        lovelace = hass.data.get("lovelace")
-        if lovelace is None or getattr(lovelace, "mode", None) != "storage":
-            # YAML-Modus: keine Auto-Registrierung möglich, User muss die
-            # Ressource manuell im Dashboard-YAML eintragen.
-            return
+        try:
+            lovelace = hass.data.get("lovelace")
+            if lovelace is None:
+                _LOGGER.warning(
+                    "Dashboard-Visibility: hass.data['lovelace'] nicht gefunden - "
+                    "Ressource wird nicht automatisch registriert. Bitte manuell unter "
+                    "Einstellungen -> Dashboards -> Ressourcen eintragen: %s",
+                    resource_url,
+                )
+                return
 
-        resources = lovelace.resources
-        if not resources.loaded:
-            async_call_later(hass, RESOURCE_RETRY_SECONDS, _register_resource)
-            return
+            mode = getattr(lovelace, "mode", None)
+            if mode != "storage":
+                _LOGGER.warning(
+                    "Dashboard-Visibility: Lovelace-Modus ist '%s' (nicht 'storage') - "
+                    "Ressource wird nicht automatisch registriert. Bitte manuell unter "
+                    "Einstellungen -> Dashboards -> Ressourcen eintragen: %s",
+                    mode,
+                    resource_url,
+                )
+                return
 
-        existing = next(
-            (
-                item
-                for item in resources.async_items()
-                if item["url"].split("?")[0] == resource_url_base
-            ),
-            None,
-        )
-        if existing is None:
-            await resources.async_create_item({"res_type": "module", "url": resource_url})
-            _LOGGER.info("Dashboard-Visibility-Karte als Lovelace-Ressource registriert.")
-        elif existing["url"] != resource_url:
-            await resources.async_update_item(
-                existing["id"], {"res_type": "module", "url": resource_url}
+            resources = getattr(lovelace, "resources", None)
+            if resources is None:
+                _LOGGER.warning(
+                    "Dashboard-Visibility: lovelace.resources nicht gefunden (unerwartete "
+                    "HA-Version?). Bitte manuell unter Einstellungen -> Dashboards -> "
+                    "Ressourcen eintragen: %s",
+                    resource_url,
+                )
+                return
+
+            if not resources.loaded:
+                _LOGGER.info(
+                    "Dashboard-Visibility: Ressourcen-Liste noch nicht geladen, "
+                    "versuche es in %s Sekunden erneut.",
+                    RESOURCE_RETRY_SECONDS,
+                )
+                async_call_later(hass, RESOURCE_RETRY_SECONDS, _register_resource)
+                return
+
+            existing = next(
+                (
+                    item
+                    for item in resources.async_items()
+                    if item["url"].split("?")[0] == resource_url_base
+                ),
+                None,
             )
-            _LOGGER.info("Dashboard-Visibility-Karte auf Version %s aktualisiert.", version)
+            if existing is None:
+                await resources.async_create_item({"res_type": "module", "url": resource_url})
+                _LOGGER.info("Dashboard-Visibility-Karte als Lovelace-Ressource registriert: %s", resource_url)
+            elif existing["url"] != resource_url:
+                await resources.async_update_item(
+                    existing["id"], {"res_type": "module", "url": resource_url}
+                )
+                _LOGGER.info("Dashboard-Visibility-Karte auf Version %s aktualisiert.", version)
+            else:
+                _LOGGER.info("Dashboard-Visibility-Karte bereits aktuell registriert: %s", resource_url)
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception(
+                "Dashboard-Visibility: unerwarteter Fehler bei der Ressourcen-Registrierung. "
+                "Bitte manuell unter Einstellungen -> Dashboards -> Ressourcen eintragen: %s",
+                resource_url,
+            )
 
     if hass.state is CoreState.running:
         hass.async_create_task(_register_resource())
