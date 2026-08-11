@@ -8,13 +8,22 @@ Card/resource registration follows the "Developer Guide: Embedded
 Lovelace Card in a Home Assistant Integration" pattern: registration
 happens once in async_setup() (not async_setup_entry), and the
 Lovelace resource is written through the REAL, running lovelace
-object (hass.data["lovelace"].resources) rather than a separate,
-raw Store("lovelace_resources") instance. Lovelace's own
+object (hass.data["lovelace"], a LovelaceData dataclass) rather than
+a separate, raw Store("lovelace_resources") instance. Lovelace's own
 ResourceStorageCollection is lazy-loaded; writing to a second, raw
 Store for the same storage key can race with it and get silently
 overwritten once the real collection saves its own (stale) in-memory
 state. Going through resources.async_create_item()/async_update_item()
 avoids that entirely.
+
+NOTE (confirmed 2026-08-11 via a real-world failure + HA core source):
+As of HA 2026.2, LovelaceData.mode was renamed to
+LovelaceData.resource_mode (old attribute deprecated with a fallback
+that was removed again around 2026.8). Code here checks
+resource_mode first and falls back to the old mode attribute for
+older HA versions, logging a WARNING (visible without debug logging)
+at every point registration can silently no-op, so a future rename
+like this doesn't go unnoticed again.
 
 Per-user sidebar visibility (which dashboards are hidden for whom) is
 read/written via async_user_store() from
@@ -124,7 +133,11 @@ async def _async_register_card(hass: HomeAssistant) -> None:
                 )
                 return
 
-            mode = getattr(lovelace, "mode", None)
+            mode = getattr(lovelace, "resource_mode", None)
+            if mode is None:
+                # Fallback für HA-Versionen vor 2026.2, in denen das
+                # Attribut noch "mode" statt "resource_mode" hieß.
+                mode = getattr(lovelace, "mode", None)
             if mode != "storage":
                 _LOGGER.warning(
                     "Dashboard-Visibility: Lovelace-Modus ist '%s' (nicht 'storage') - "
