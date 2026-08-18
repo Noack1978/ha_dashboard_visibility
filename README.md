@@ -5,6 +5,13 @@ der ein Admin **von seinem eigenen Gerät aus, ohne sich als anderer Nutzer
 anzumelden**, für jeden Benutzer und jedes Dashboard per Checkbox steuert,
 ob das Dashboard in dessen Sidebar erscheint.
 
+## Screenshots
+<img width="2247" height="935" alt="1000062032" src="https://github.com/user-attachments/assets/0c519a21-6233-4aa8-b4fe-ab013804cd62" />
+<img width="2231" height="939" alt="1000062033" src="https://github.com/user-attachments/assets/e2cd60bf-6957-4210-b223-67eaa6dde430" />
+<img width="2229" height="920" alt="1000062034" src="https://github.com/user-attachments/assets/1edbee0d-d710-4615-a54e-caebd7f0c304" />
+
+
+
 ## Funktionsweise
 
 Die Karte zeigt eine Matrix: Zeilen = Dashboards, Spalten = Benutzer,
