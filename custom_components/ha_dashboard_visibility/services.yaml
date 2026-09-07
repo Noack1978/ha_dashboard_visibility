@@ -1,2 +1,51 @@
-# Dashboard Visibility Manager exposes no services.
-# All interaction happens via the Lovelace card (websocket API).
+parse_text:
+  name: Rezept aus Text analysieren
+  description: Analysiert einen Rezepttext via Konversationsagent und schreibt das Ergebnis nach import_result.json.
+  fields:
+    text:
+      name: Rezepttext
+      description: Der zu analysierende Rezepttext (beliebiges Format).
+      required: true
+      selector:
+        text:
+          multiline: true
+
+parse_image:
+  name: Rezept aus Bild analysieren
+  description: Analysiert ein Rezeptfoto oder einen Scan via LLM Vision.
+  fields:
+    image_data:
+      name: Bilddaten (Base64)
+      description: Base64-kodiertes Bild (JPG, PNG, WEBP).
+      required: true
+      selector:
+        text:
+    mime_type:
+      name: MIME-Typ
+      description: "Bildtyp, z.B. image/jpeg"
+      default: "image/jpeg"
+      selector:
+        text:
+
+parse_url:
+  name: Rezept von URL importieren
+  description: Ruft eine Webseite ab und extrahiert das Rezept daraus.
+  fields:
+    url:
+      name: URL
+      description: Adresse der Rezept-Webseite.
+      required: true
+      selector:
+        text:
+
+parse_pdf:
+  name: PDF-Rezept importieren
+  description: Extrahiert Text aus einer PDF-Datei und analysiert ihn als Rezept.
+  fields:
+    pdf_data:
+      name: PDF-Daten (base64)
+      description: Base64-kodierter Inhalt der PDF-Datei.
+      required: true
+      example: "JVBERi0xLjQK..."
+      selector:
+        text:

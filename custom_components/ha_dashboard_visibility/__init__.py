@@ -1,347 +1,700 @@
-"""Dashboard Visibility Manager.
-
-Provides a Lovelace card that lets an admin control, per user, which
-dashboards show up in that user's sidebar - without having to log in
-as that user or open per-view visibility dialogs one by one.
-
-Card/resource registration follows the "Developer Guide: Embedded
-Lovelace Card in a Home Assistant Integration" pattern: registration
-happens once in async_setup() (not async_setup_entry), and the
-Lovelace resource is written through the REAL, running lovelace
-object (hass.data["lovelace"], a LovelaceData dataclass) rather than
-a separate, raw Store("lovelace_resources") instance. Lovelace's own
-ResourceStorageCollection is lazy-loaded; writing to a second, raw
-Store for the same storage key can race with it and get silently
-overwritten once the real collection saves its own (stale) in-memory
-state. Going through resources.async_create_item()/async_update_item()
-avoids that entirely.
-
-NOTE (confirmed 2026-08-11 via a real-world failure + HA core source):
-As of HA 2026.2, LovelaceData.mode was renamed to
-LovelaceData.resource_mode (old attribute deprecated with a fallback
-that was removed again around 2026.8). Code here checks
-resource_mode first and falls back to the old mode attribute for
-older HA versions, logging a WARNING (visible without debug logging)
-at every point registration can silently no-op, so a future rename
-like this doesn't go unnoticed again.
-
-Per-user sidebar visibility (which dashboards are hidden for whom) is
-read/written via async_user_store() from
-homeassistant.components.frontend.storage - the exact same cached
-per-user store Home Assistant's own frontend uses for the "Change
-order and hide items from the sidebar" feature in the user profile
-(data key "sidebar" -> {"panelOrder": [...], "hiddenPanels": [...]}).
-HA keeps a per-user UserStore cached in memory once loaded; a raw
-file write to frontend.user_data_{user_id} would be invisible to a
-running instance until that cache is evicted (effectively: until the
-next HA restart). async_user_store() updates the live cache too, so
-changes take effect immediately.
-"""
+"""Rezepte Import – optionale Erweiterung fuer ha-rezepte."""
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import time
 from pathlib import Path
-from typing import Any
 
-import voluptuous as vol
-
-from homeassistant.components.http import StaticPathConfig
-from homeassistant.components import websocket_api
-from homeassistant.components.frontend.storage import async_user_store
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
-from homeassistant.core import CoreState, HomeAssistant
-from homeassistant.helpers.event import async_call_later
-from homeassistant.helpers.typing import ConfigType
-
-from .const import (
-    CARD_FILENAME,
-    DOMAIN,
-    SIDEBAR_USER_DATA_KEY,
-    STATIC_URL_BASE,
-)
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 _LOGGER = logging.getLogger(__name__)
 
-RESOURCE_RETRY_SECONDS = 5
+DOMAIN                    = "rezepte_import"
+REZEPTE_DOMAIN            = "rezepte"
+RESULT_FILE               = "import_result.json"
+AGENT_ID_DEFAULT          = "conversation.google_generative_ai"
+LLMVISION_PROVIDER_DEFAULT = "Google"
+MAX_TEXT_LENGTH           = 8000
+VALID_UNITS               = {"g", "kg", "ml", "l", "TL", "EL", "Stk.", "Prise", "n.B."}
+
+_PROMPT_BASE = """Du bist ein Rezept-Extraktor. Antworte IMMER nur mit einem validen JSON-Objekt.
+Kein Text davor oder danach, kein Markdown, keine Erklaerung – nur JSON.
+Auch wenn der Inhalt unleserlich wirkt: gib trotzdem JSON zurueck.
+
+Format:
+{
+  "title": "Rezeptname",
+  "subtitle": "Geraetename oder Variante (leer wenn nicht vorhanden)",
+  "emoji": "passendes Emoji",
+  "category": "Kategorie",
+  "description": "1-2 Saetze Kurzbeschreibung",
+  "baseServings": 4,
+  "servingLabel": "Portionen",
+  "ingredients": [{"amount": 200, "unit": "g", "name": "Zutatname"}],
+  "steps": [{"text": "Schrittbeschreibung", "timerSec": 300, "airfryerTemp": 0, "airfryerTime": 0}],
+  "notes": ["Tipp"]
+}
+
+Regeln: amount=Zahl, unit eines von: g kg ml l TL EL Stk. Prise n.B.
+timerSec=Sekunden (0 wenn kein Timer). Kein Rezept erkennbar: title="Kein Rezept erkannt" ingredients=[] steps=[].
+airfryerTemp=Airfryer-Temperatur in Grad Celsius (0 wenn Schritt keine Airfryer-Temperaturangabe enthaelt).
+airfryerTime=Airfryer-Zeit in Minuten (0 wenn Schritt keine Airfryer-Zeitangabe enthaelt).
+Setze airfryerTemp/airfryerTime NUR wenn der Schritt explizit Heissluftfritteuse/Airfryer erwaehnt
+oder das Rezept eindeutig ein Airfryer-Rezept ist (z. B. Geraetename im subtitle enthaelt "Airfryer"/"Heissluftfritteuse").
+WICHTIG fuer steps.text: KEINE Mengenangaben in den Schritten (keine Zahlen wie "200g" oder "3 EL").
+Verwende stattdessen nur Bezeichnungen wie "das Mehl", "die Butter", "das Oel".
+Die Mengen stehen bereits in der Zutatenliste und werden automatisch skaliert.
+ANTWORTE NUR MIT JSON.
+
+Rezepttext:
+"""
+
+_PROMPT_IMAGE = """Du bist ein Rezept-Extraktor. Analysiere das Bild und gib AUSSCHLIESSLICH ein JSON-Objekt zurueck.
+Kein Text, kein Markdown – nur JSON.
+
+Format:
+{
+  "title": "Rezeptname",
+  "subtitle": "",
+  "emoji": "passendes Emoji",
+  "category": "Kategorie",
+  "description": "Kurzbeschreibung",
+  "baseServings": 4,
+  "servingLabel": "Portionen",
+  "ingredients": [{"amount": 200, "unit": "g", "name": "Zutatname"}],
+  "steps": [{"text": "Schrittbeschreibung", "timerSec": 0, "airfryerTemp": 0, "airfryerTime": 0}],
+  "notes": []
+}
+
+Regeln: amount=Zahl, unit eines von: g kg ml l TL EL Stk. Prise n.B., timerSec=Sekunden.
+airfryerTemp=Airfryer-Temperatur in Grad Celsius, airfryerTime=Airfryer-Zeit in Minuten
+(beide 0 wenn kein Airfryer-Rezept bzw. Schritt keine Angabe enthaelt).
+ANTWORTE NUR MIT JSON."""
 
 
-async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
-    """Set up the integration (runs once, regardless of config entries)."""
-    await _async_register_card(hass)
 
-    websocket_api.async_register_command(hass, websocket_get_data)
-    websocket_api.async_register_command(hass, websocket_set_hidden)
+def _get_prompt(entry_data: dict) -> str:
+    """Aktiven Prompt aus Konfiguration lesen."""
+    if entry_data.get("prompt_mode") == "custom":
+        custom = entry_data.get("custom_prompt", "").strip()
+        if custom:
+            return custom + "\n\nRezepttext:\n"
+    return _PROMPT_BASE
 
-    return True
 
+def _get_image_prompt(entry_data: dict) -> str:
+    """Aktiven Bild-Prompt aus Konfiguration lesen."""
+    if entry_data.get("image_prompt_mode") == "custom":
+        custom = entry_data.get("custom_image_prompt", "").strip()
+        if custom:
+            return custom
+    return _PROMPT_IMAGE
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Dashboard Visibility Manager from a config entry."""
-    hass.data.setdefault(DOMAIN, {})
+    """Services einrichten."""
+    agent_id       = entry.data.get("conversation_agent", AGENT_ID_DEFAULT)
+    llmvision_prov = entry.data.get("llmvision_provider", LLMVISION_PROVIDER_DEFAULT)
+    prompt_base    = _get_prompt(entry.data)
+    image_prompt   = _get_image_prompt(entry.data)
+    vision_api_key = entry.data.get("vision_api_key", "").strip()
+    vision_model   = entry.data.get("vision_model", "meta-llama/llama-4-maverick-17b-128e-instruct").strip()
+
+    # ── parse_text ────────────────────────────────────────────────────────────
+    async def handle_parse_text(call: ServiceCall) -> None:
+        text = call.data.get("text", "").strip()
+        if not text:
+            await _write_error(hass, "Kein Text uebergeben.")
+            return
+        await _call_conversation(hass, agent_id, prompt_base + text)
+
+    # ── parse_image ───────────────────────────────────────────────────────────
+    async def handle_parse_image(call: ServiceCall) -> None:
+        image_b64 = call.data.get("image_data", "")
+        mime_type  = call.data.get("mime_type", "image/jpeg")
+        if not image_b64:
+            await _write_error(hass, "Keine Bilddaten uebergeben.")
+            return
+        ext      = "jpg" if "jpeg" in mime_type else mime_type.split("/")[-1]
+        tmp_path = f"/tmp/rezept_import_{int(time.time())}.{ext}"
+        await hass.async_add_executor_job(_write_image_file, tmp_path, image_b64)
+        try:
+            response_text = await _analyze_image(hass, tmp_path, llmvision_prov, image_prompt, vision_api_key, vision_model)
+            await _write_parsed(hass, response_text)
+        except Exception as err:
+            await _write_error(hass, f"Bilderkennung fehlgeschlagen: {err}")
+        finally:
+            await hass.async_add_executor_job(_delete_file, tmp_path)
+
+    # ── parse_url ─────────────────────────────────────────────────────────────
+    async def handle_parse_url(call: ServiceCall) -> None:
+        url = call.data.get("url", "").strip()
+        if not url:
+            await _write_error(hass, "Keine URL uebergeben.")
+            return
+        try:
+            session = async_get_clientsession(hass)
+            import aiohttp
+            async with session.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; HA-Rezepte-Import/1.0)"},
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                resp.raise_for_status()
+                html = await resp.text(errors="replace")
+        except Exception as err:
+            await _write_error(hass, f"URL abrufen fehlgeschlagen: {err}")
+            return
+
+        # JSON-LD zuerst versuchen (strukturierte Rezeptdaten vieler Rezeptseiten)
+        jsonld = _extract_jsonld_recipe(html)
+        if jsonld:
+            text = f"Strukturierte Rezeptdaten (JSON-LD):\n{jsonld}"
+        else:
+            text = _extract_text_from_html(html)[:MAX_TEXT_LENGTH]
+
+        await _call_conversation(hass, agent_id, prompt_base + text)
+
+    # ── parse_pdf ──────────────────────────────────────────────────────────────
+    async def handle_parse_pdf(call: ServiceCall) -> None:
+        pdf_b64 = call.data.get("pdf_data", "")
+        if not pdf_b64:
+            await _write_error(hass, "Keine PDF-Daten uebergeben.")
+            return
+        # Text extrahieren (Executor-Thread, da synchrone pypdf-Operation)
+        try:
+            text = await hass.async_add_executor_job(_extract_pdf_text, pdf_b64)
+        except Exception as err:
+            await _write_error(hass, f"PDF-Verarbeitung fehlgeschlagen: {err}")
+            return
+        if not text.strip():
+            # Kein Text → gescanntes PDF → Fallback: erste Seite via Groq Vision
+            if not vision_api_key:
+                await _write_error(
+                    hass,
+                    "Kein Text im PDF gefunden (gescanntes PDF). "
+                    "Tipp: Groq API-Key in der Konfiguration eintragen "
+                    "um gescannte PDFs automatisch zu verarbeiten. "
+                    "Alternativ: Google Lens → Text-Tab.",
+                )
+                return
+            _LOGGER.debug("PDF ohne Text – versuche Groq Vision Fallback (pypdf Bildextraktion)")
+            try:
+                img_b64, _mime = await hass.async_add_executor_job(
+                    _pdf_page_to_image, pdf_b64
+                )
+            except Exception as err:
+                await _write_error(hass, f"PDF→Bild Konvertierung fehlgeschlagen: {err}")
+                return
+            tmp_path = f"/tmp/rezept_pdf_page_{int(time.time())}.jpg"
+            await hass.async_add_executor_job(_write_image_file, tmp_path, img_b64)
+            try:
+                response_text = await _analyze_image(
+                    hass, tmp_path, llmvision_prov,
+                    image_prompt, vision_api_key, vision_model,
+                )
+                await _write_parsed(hass, response_text)
+            except Exception as err:
+                await _write_error(hass, f"Gescanntes PDF – Bildanalyse fehlgeschlagen: {err}")
+            finally:
+                await hass.async_add_executor_job(_delete_file, tmp_path)
+            return
+        _LOGGER.debug("PDF: %d Zeichen Text extrahiert", len(text))
+        await _call_conversation(hass, agent_id, prompt_base + text[:MAX_TEXT_LENGTH])
+
+    hass.services.async_register(DOMAIN, "parse_text",  handle_parse_text)
+    hass.services.async_register(DOMAIN, "parse_image", handle_parse_image)
+    hass.services.async_register(DOMAIN, "parse_url",   handle_parse_url)
+    hass.services.async_register(DOMAIN, "parse_pdf",   handle_parse_pdf)
+
+    _LOGGER.info("Rezepte Import geladen (Agent: %s, Vision: %s)", agent_id, llmvision_prov)
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    hass.data.pop(DOMAIN, None)
+    for svc in ("parse_text", "parse_image", "parse_url", "parse_pdf"):
+        hass.services.async_remove(DOMAIN, svc)
     return True
 
 
-def _read_manifest_version() -> str:
-    """Read the version from manifest.json (sync, run in executor)."""
-    manifest_path = Path(__file__).parent / "manifest.json"
-    try:
-        with manifest_path.open(encoding="utf-8") as f:
-            return json.load(f).get("version", "0")
-    except (OSError, json.JSONDecodeError):
-        return "0"
+# ── KI-Aufruf ─────────────────────────────────────────────────────────────────
 
 
-async def _async_register_card(hass: HomeAssistant) -> None:
-    """Serve the card's JS and register it as a Lovelace resource.
+async def _analyze_image(
+    hass: HomeAssistant,
+    image_path: str,
+    llmvision_prov: str = "Google",
+    image_prompt: str = _PROMPT_IMAGE,
+    vision_api_key: str = "",
+    vision_model: str = "meta-llama/llama-4-maverick-17b-128e-instruct",
+) -> str:
+    """Bild analysieren.
 
-    Static path registration happens immediately (idempotent via
-    try/except RuntimeError). The Lovelace resource registration is
-    deferred until the real lovelace object's resource collection has
-    finished loading, since it's lazy-loaded and not necessarily ready
-    yet when async_setup() runs.
+    Reihenfolge:
+    1. Direkter OpenAI-kompatibler Vision-API-Aufruf (wenn API-Key vorhanden)
+    2. LLM Vision (Fallback)
     """
-    js_path = Path(__file__).parent / "frontend" / CARD_FILENAME
-    resource_url_base = f"{STATIC_URL_BASE}/{CARD_FILENAME}"
+    import base64
+    import aiohttp as _aiohttp
 
-    try:
-        await hass.http.async_register_static_paths(
-            [StaticPathConfig(resource_url_base, str(js_path), cache_headers=False)]
-        )
-    except RuntimeError:
-        pass  # Route bereits registriert (z. B. nach Reload)
+    errors: list[str] = []
 
-    version = await hass.async_add_executor_job(_read_manifest_version)
-    resource_url = f"{resource_url_base}?v={version}"
-
-    async def _register_resource(_now: Any = None) -> None:
+    # ── 1. Direkte Vision API (Groq oder OpenAI-kompatibel) ──────────────────
+    if vision_api_key:
         try:
-            lovelace = hass.data.get("lovelace")
-            if lovelace is None:
-                _LOGGER.warning(
-                    "Dashboard-Visibility: hass.data['lovelace'] nicht gefunden - "
-                    "Ressource wird nicht automatisch registriert. Bitte manuell unter "
-                    "Einstellungen -> Dashboards -> Ressourcen eintragen: %s",
-                    resource_url,
-                )
-                return
+            # Bild als base64 lesen (im Executor-Thread)
+            def _read_b64() -> tuple[str, str]:
+                ext = image_path.lower().rsplit(".", 1)[-1]
+                mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                        "png": "image/png", "webp": "image/webp"}.get(ext, "image/jpeg")
+                with open(image_path, "rb") as fh:
+                    return base64.b64encode(fh.read()).decode(), mime
 
-            mode = getattr(lovelace, "resource_mode", None)
-            if mode is None:
-                # Fallback für HA-Versionen vor 2026.2, in denen das
-                # Attribut noch "mode" statt "resource_mode" hieß.
-                mode = getattr(lovelace, "mode", None)
-            if mode != "storage":
-                _LOGGER.warning(
-                    "Dashboard-Visibility: Lovelace-Modus ist '%s' (nicht 'storage') - "
-                    "Ressource wird nicht automatisch registriert. Bitte manuell unter "
-                    "Einstellungen -> Dashboards -> Ressourcen eintragen: %s",
-                    mode,
-                    resource_url,
-                )
-                return
+            b64, mime = await hass.async_add_executor_job(_read_b64)
 
-            resources = getattr(lovelace, "resources", None)
-            if resources is None:
-                _LOGGER.warning(
-                    "Dashboard-Visibility: lovelace.resources nicht gefunden (unerwartete "
-                    "HA-Version?). Bitte manuell unter Einstellungen -> Dashboards -> "
-                    "Ressourcen eintragen: %s",
-                    resource_url,
-                )
-                return
+            # Endpoint: Groq Standard, kann per vision_model-Praefix ueberschrieben werden
+            endpoint = "https://api.groq.com/openai/v1/chat/completions"
 
-            if not resources.loaded:
-                _LOGGER.info(
-                    "Dashboard-Visibility: Ressourcen-Liste noch nicht geladen, "
-                    "versuche es in %s Sekunden erneut.",
-                    RESOURCE_RETRY_SECONDS,
-                )
-                async_call_later(hass, RESOURCE_RETRY_SECONDS, _register_resource)
-                return
+            session = async_get_clientsession(hass)
+            async with session.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {vision_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": vision_model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": image_prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:{mime};base64,{b64}"
+                            }},
+                        ],
+                    }],
+                    "max_tokens": 8192,
+                },
+                timeout=_aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                resp.raise_for_status()
+                data = await resp.json()
+                text = data["choices"][0]["message"]["content"]
+                if text:
+                    _LOGGER.debug("Bild analysiert via direkter Vision API (%s)", vision_model)
+                    return str(text)
+                errors.append("Vision API: leere Antwort")
+        except Exception as err:
+            errors.append(f"Vision API ({vision_model}): {err}")
+            _LOGGER.warning("Direkte Vision API fehlgeschlagen: %s", err)
 
-            existing = next(
-                (
-                    item
-                    for item in resources.async_items()
-                    if item["url"].split("?")[0] == resource_url_base
-                ),
-                None,
-            )
-            if existing is None:
-                await resources.async_create_item({"res_type": "module", "url": resource_url})
-                _LOGGER.info("Dashboard-Visibility-Karte als Lovelace-Ressource registriert: %s", resource_url)
-            elif existing["url"] != resource_url:
-                await resources.async_update_item(
-                    existing["id"], {"res_type": "module", "url": resource_url}
-                )
-                _LOGGER.info("Dashboard-Visibility-Karte auf Version %s aktualisiert.", version)
-            else:
-                _LOGGER.info("Dashboard-Visibility-Karte bereits aktuell registriert: %s", resource_url)
-        except Exception:  # noqa: BLE001
-            _LOGGER.exception(
-                "Dashboard-Visibility: unerwarteter Fehler bei der Ressourcen-Registrierung. "
-                "Bitte manuell unter Einstellungen -> Dashboards -> Ressourcen eintragen: %s",
-                resource_url,
-            )
-
-    if hass.state is CoreState.running:
-        hass.async_create_task(_register_resource())
-    else:
-        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, _register_resource)
-
-
-def _panel_display_title(url_path: str, panel: Any) -> str:
-    """Return a human-friendly title for a panel.
-
-    Built-in system panels and some auto-generated dashboards don't
-    always have a sidebar_title set (HA's frontend fills in a
-    localized label at display time instead). Without a translation
-    layer available here, fall back to something more readable than
-    the raw url_path.
-    """
-    if panel.sidebar_title:
-        return panel.sidebar_title
-    if url_path == "lovelace":
-        return "Übersicht (Standard-Dashboard)"
-    return url_path.replace("-", " ").replace("_", " ").title()
-
-
-def _get_dashboards(hass: HomeAssistant) -> list[dict[str, Any]]:
-    """Return all panels that Home Assistant considers sidebar-eligible.
-
-    This includes user-created Lovelace dashboards as well as panels
-    registered by integrations (e.g. Energy, Map, Calendar, To-do,
-    Settings) and add-on/ingress panels - anything with show_in_sidebar
-    True, since that's the same flag HA's own sidebar uses to decide
-    what CAN appear there at all. A handful of purely technical panels
-    that are never meant to show up (like the 404 fallback panel) are
-    excluded explicitly. component_name is included so the card can
-    group entries and show what kind of panel each one is.
-    """
-    panels: dict[str, Any] = hass.data.get("frontend_panels", {})
-    excluded_url_paths = {
-        "notfound",  # 404-Fallback, nie sinnvoll in der Sidebar
-        "profile",  # eigenes Profil, immer über Avatar erreichbar, kein echtes Dashboard
-        "_my_redirect",  # technischer Weiterleitungs-Mechanismus (my.home-assistant.io), keine eigene Seite
-        "config",  # Häkchen hat keine Auswirkung auf die Sichtbarkeit (von Mirko bestätigt)
-        "app",  # "App"-Eintrag, Häkchen hat keine Auswirkung auf die Sichtbarkeit (von Mirko bestätigt)
-    }
-    dashboards = []
-    for url_path, panel in panels.items():
-        if url_path in excluded_url_paths:
-            continue
-        if not getattr(panel, "show_in_sidebar", True):
-            continue
-        dashboards.append(
+    # ── 2. LLM Vision Fallback ────────────────────────────────────────────────
+    try:
+        result = await hass.services.async_call(
+            "llmvision", "image_analyzer",
             {
-                "url_path": url_path,
-                "title": _panel_display_title(url_path, panel),
-                "icon": panel.sidebar_icon,
-                "require_admin": panel.require_admin,
-                "component_name": getattr(panel, "component_name", "") or "",
-            }
+                "provider":         llmvision_prov,
+                "message":          image_prompt,
+                "image_file":       [image_path],
+                "max_tokens":       8192,
+                "target_width":     1920,
+                "include_filename": False,
+            },
+            blocking=True,
+            return_response=True,
         )
-    dashboards.sort(key=lambda d: (d["component_name"], d["title"].lower()))
-    return dashboards
+        text = result.get("response_text", "")
+        if isinstance(text, list):
+            text = "\n".join(
+                x.get("text", str(x)) if isinstance(x, dict) else str(x)
+                for x in text
+            )
+        if text:
+            _LOGGER.debug("Bild analysiert via LLM Vision (%s)", llmvision_prov)
+            return str(text)
+        errors.append(f"LLM Vision ({llmvision_prov}): leere Antwort")
+    except Exception as err:
+        errors.append(f"LLM Vision ({llmvision_prov}): {err}")
+        _LOGGER.debug("LLM Vision fehlgeschlagen: %s", err)
 
-
-async def _async_get_hidden_panels(hass: HomeAssistant, user_id: str) -> list[str]:
-    """Read hiddenPanels via HA's own cached UserStore (not a raw file read).
-
-    Home Assistant keeps a per-user in-memory cache (UserStore, populated
-    the first time anything - including the user's own browser - reads
-    or writes their frontend user data). Reading the file directly on
-    disk would miss any change that only exists in that cache, and
-    writing directly to the file would be invisible to the running
-    instance until the cache is evicted (effectively: until next HA
-    restart). Going through async_user_store() guarantees we see/update
-    the exact same data the frontend itself uses.
-    """
-    store = await async_user_store(hass, user_id)
-    sidebar = store.data.get(SIDEBAR_USER_DATA_KEY) or {}
-    hidden = sidebar.get("hiddenPanels")
-    if isinstance(hidden, list):
-        return list(hidden)
-    return []
-
-
-async def _async_set_hidden_panel(
-    hass: HomeAssistant, user_id: str, url_path: str, hidden: bool
-) -> None:
-    """Add or remove a single dashboard from a user's hiddenPanels list.
-
-    Only touches hiddenPanels - panelOrder and any other keys already
-    stored for the user (including other, unrelated frontend user_data
-    such as onboarding flags) are preserved as-is. Uses async_user_store()
-    so the change is written through HA's own cache: it takes effect
-    immediately for a connected client (via the store's subscription
-    mechanism) and is correctly seen on the next sidebar load, instead of
-    only reaching the file on disk.
-    """
-    store = await async_user_store(hass, user_id)
-    sidebar = dict(store.data.get(SIDEBAR_USER_DATA_KEY) or {})
-    hidden_panels = list(sidebar.get("hiddenPanels") or [])
-
-    if hidden and url_path not in hidden_panels:
-        hidden_panels.append(url_path)
-    elif not hidden and url_path in hidden_panels:
-        hidden_panels.remove(url_path)
-    else:
-        return  # no change needed
-
-    sidebar["hiddenPanels"] = hidden_panels
-    sidebar.setdefault("panelOrder", [])
-    await store.async_set_item(SIDEBAR_USER_DATA_KEY, sidebar)
-
-
-@websocket_api.websocket_command({"type": f"{DOMAIN}/get_data"})
-@websocket_api.require_admin
-@websocket_api.async_response
-async def websocket_get_data(
-    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
-) -> None:
-    """Return dashboards, users and the current visibility matrix."""
-    dashboards = _get_dashboards(hass)
-    users = [
-        {"id": user.id, "name": user.name, "is_admin": user.is_admin}
-        for user in await hass.auth.async_get_users()
-        if not user.system_generated
-    ]
-
-    matrix: dict[str, dict[str, bool]] = {}
-    for user in users:
-        hidden_panels = await _async_get_hidden_panels(hass, user["id"])
-        matrix[user["id"]] = {
-            dash["url_path"]: dash["url_path"] in hidden_panels for dash in dashboards
-        }
-
-    connection.send_result(
-        msg["id"],
-        {"dashboards": dashboards, "users": users, "matrix": matrix},
+    raise RuntimeError(
+        "Kein Bildanalyse-Dienst verfuegbar. "
+        "Tipp: Groq API-Key in der Integration konfigurieren. "
+        f"Fehler: {'; '.join(errors)}"
     )
 
+async def _call_conversation(hass: HomeAssistant, agent_id: str, prompt: str) -> None:
+    try:
+        result = await hass.services.async_call(
+            "conversation", "process",
+            {"text": prompt, "agent_id": agent_id, "language": "de"},
+            blocking=True,
+            return_response=True,
+        )
+        response_text = (
+            result
+            .get("response", {})
+            .get("speech", {})
+            .get("plain", {})
+            .get("speech", "")
+        )
+        await _write_parsed(hass, response_text)
+    except Exception as err:
+        await _write_error(hass, f"Konversations-API Fehler: {err}")
 
-@websocket_api.websocket_command(
-    {
-        "type": f"{DOMAIN}/set_hidden",
-        vol.Required("user_id"): str,
-        vol.Required("url_path"): str,
-        vol.Required("hidden"): bool,
-    }
-)
-@websocket_api.require_admin
-@websocket_api.async_response
-async def websocket_set_hidden(
-    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict[str, Any]
-) -> None:
-    """Show or hide one dashboard for one user."""
-    await _async_set_hidden_panel(hass, msg["user_id"], msg["url_path"], msg["hidden"])
-    connection.send_result(msg["id"], {"success": True})
+
+async def _write_parsed(hass: HomeAssistant, response_text: str) -> None:
+    if isinstance(response_text, list):
+        response_text = "\n".join(str(x) for x in response_text)
+    try:
+        recipe = _parse_json_response(str(response_text))
+        recipe = _validate_recipe(recipe)
+        await _write_result(hass, {"ts": int(time.time()), "status": "ok", "recipe": recipe})
+    except Exception as err:
+        preview = str(response_text)[:200] if response_text else "(leer)"
+        await _write_error(hass, f"JSON-Parsing fehlgeschlagen: {err}. Antwort: {preview}")
+
+
+def _parse_json_response(text: str) -> dict:
+    """JSON aus KI-Antwort extrahieren und bei Bedarf reparieren.
+
+    Versucht in dieser Reihenfolge:
+    1. Direktes json.loads()
+    2. json-repair Library (behebt unescapte Zeichen, fehlende Klammern, etc.)
+    3. Eigene Fallback-Reparatur
+    """
+    text = text.strip()
+
+    # Markdown-Fences entfernen
+    if "```" in text:
+        for part in text.split("```"):
+            part = part.strip().lstrip("json").strip()
+            try:
+                return json.loads(part)
+            except Exception:
+                continue
+
+    # Direkt parsen
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    # JSON-Objekt aus umgebendem Text herausschneiden
+    start, end = text.find("{"), text.rfind("}")
+    chunk = text[start:end + 1] if start != -1 and end > start else text
+
+    # json-repair Library (haelt alle KI-typischen JSON-Fehler aus)
+    try:
+        from json_repair import repair_json  # type: ignore[import]
+        repaired = repair_json(chunk, return_objects=True)
+        if isinstance(repaired, dict) and repaired:
+            _LOGGER.debug("JSON via json-repair repariert")
+            return repaired
+    except Exception as repair_err:
+        _LOGGER.debug("json-repair fehlgeschlagen: %s", repair_err)
+
+    # Eigene Fallback-Reparatur
+    if start != -1 and end > start:
+        try:
+            return _repair_json(chunk)
+        except Exception:
+            pass
+
+    raise ValueError("Kein gueltiges JSON gefunden")
+
+
+def _repair_json(text: str) -> dict:
+    """Haeufige KI-JSON-Fehler reparieren (Steuerzeichen, Trailing Commas, Truncation)."""
+    import re as _re
+
+    # 1. Trailing commas
+    repaired = _re.sub(r",(\s*[}\]])", r"\1", text)
+    try:
+        return json.loads(repaired)
+    except Exception:
+        pass
+
+    # 2. Unescapte Steuerzeichen in JSON-Strings escapen
+    def _escape_ctrl(s: str) -> str:
+        out: list[str] = []
+        in_str = False
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == "\\" and i + 1 < len(s):
+                out.append(ch)
+                out.append(s[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = not in_str
+                out.append(ch)
+            elif in_str and ord(ch) == 10:
+                out.append("\\n")
+            elif in_str and ord(ch) == 13:
+                out.append("\\r")
+            elif in_str and ord(ch) == 9:
+                out.append("\\t")
+            else:
+                out.append(ch)
+            i += 1
+        return "".join(out)
+
+    repaired2 = _escape_ctrl(repaired)
+    try:
+        return json.loads(repaired2)
+    except Exception:
+        pass
+
+    # 3. Abgeschnittenes JSON: letzten unvollstaendigen Eintrag entfernen
+    candidate = repaired2
+    for _ in range(15):
+        last_comma = candidate.rfind(",")
+        if last_comma < 0:
+            break
+        candidate = candidate[:last_comma]
+        opens     = candidate.count("{") - candidate.count("}")
+        arr_opens = candidate.count("[") - candidate.count("]")
+        if opens >= 0 and arr_opens >= 0:
+            closed = candidate + "]" * arr_opens + "}" * opens
+            closed = _re.sub(r",(\s*[}\]])", r"\1", closed)
+            try:
+                return json.loads(closed)
+            except Exception:
+                continue
+
+    raise ValueError("JSON-Reparatur fehlgeschlagen")
+
+
+def _validate_recipe(r: dict) -> dict:
+    r.setdefault("title",        "Importiertes Rezept")
+    r.setdefault("subtitle",     "")
+    r.setdefault("emoji",        "\U0001f373")
+    if not r.get("emoji"):
+        r["emoji"] = "\U0001f373"
+    r.setdefault("category",     "")
+    r.setdefault("description",  "")
+    r.setdefault("servingLabel", "Portionen")
+    r.setdefault("notes",        [])
+    try:
+        r["baseServings"] = max(1, int(r.get("baseServings", 4)))
+    except (ValueError, TypeError):
+        r["baseServings"] = 4
+    cleaned_ings = []
+    for ing in r.get("ingredients", []):
+        if not isinstance(ing, dict):
+            continue
+        try:
+            ing["amount"] = float(ing.get("amount", 0)) or 0.0
+        except (ValueError, TypeError):
+            ing["amount"] = 0.0
+        if ing.get("unit") not in VALID_UNITS:
+            ing["unit"] = "g"
+        ing.setdefault("name", "")
+        if ing["name"]:
+            cleaned_ings.append(ing)
+    r["ingredients"] = cleaned_ings
+    cleaned_steps = []
+    for step in r.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        try:
+            step["timerSec"] = max(0, int(step.get("timerSec", 0)))
+        except (ValueError, TypeError):
+            step["timerSec"] = 0
+        try:
+            step["airfryerTemp"] = max(0, int(step.get("airfryerTemp", 0)))
+        except (ValueError, TypeError):
+            step["airfryerTemp"] = 0
+        try:
+            step["airfryerTime"] = max(0, int(step.get("airfryerTime", 0)))
+        except (ValueError, TypeError):
+            step["airfryerTime"] = 0
+        step.setdefault("text", "")
+        if step["text"]:
+            cleaned_steps.append(step)
+    r["steps"] = cleaned_steps
+    r["notes"] = [str(n) for n in r.get("notes", []) if n]
+    return r
+
+
+# ── Dateihilfsfunktionen ──────────────────────────────────────────────────────
+
+def _result_path(hass: HomeAssistant) -> Path:
+    return Path(hass.config.path("www", REZEPTE_DOMAIN, RESULT_FILE))
+
+async def _write_result(hass: HomeAssistant, data: dict) -> None:
+    """Ergebnis-JSON asynchron in Executor-Thread schreiben."""
+    path    = _result_path(hass)
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    def _write() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    await hass.async_add_executor_job(_write)
+
+async def _write_error(hass: HomeAssistant, msg: str) -> None:
+    _LOGGER.error("Rezepte Import: %s", msg)
+    await _write_result(hass, {"ts": int(time.time()), "status": "error", "error": msg})
+
+def _write_image_file(path: str, b64: str) -> None:
+    missing = len(b64) % 4
+    if missing:
+        b64 += "=" * (4 - missing)
+    Path(path).write_bytes(base64.b64decode(b64))
+
+def _delete_file(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ── HTML / JSON-LD Extraktion ─────────────────────────────────────────────────
+
+
+def _extract_pdf_text(pdf_b64: str) -> str:
+    """Text aus PDF-Datei extrahieren (pypdf).
+
+    Gibt leeren String zurueck wenn kein Text gefunden (gescanntes PDF).
+    """
+    import io as _io
+    try:
+        import pypdf
+    except ImportError:
+        raise RuntimeError(
+            "pypdf nicht installiert – bitte Home Assistant neu starten "
+            "damit die Abhaengigkeit installiert wird."
+        )
+    missing = len(pdf_b64) % 4
+    if missing:
+        pdf_b64 += "=" * (4 - missing)
+    pdf_bytes = base64.b64decode(pdf_b64)
+    reader = pypdf.PdfReader(_io.BytesIO(pdf_bytes))
+    pages: list[str] = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append(text)
+    return "\n".join(pages).strip()
+
+
+def _pdf_page_to_image(pdf_b64: str) -> tuple[str, str]:
+    """Eingebettetes Bild aus erster PDF-Seite extrahieren (pypdf).
+
+    Funktioniert fuer gescannte PDFs die ein eingebettetes Bild enthalten.
+    Gibt (base64_string, mime_type) zurueck.
+    """
+    import io as _io
+    import pypdf
+
+    missing = len(pdf_b64) % 4
+    if missing:
+        pdf_b64 += "=" * (4 - missing)
+    pdf_bytes = base64.b64decode(pdf_b64)
+    reader = pypdf.PdfReader(_io.BytesIO(pdf_bytes))
+
+    page = reader.pages[0]
+    images = list(page.images)
+    if not images:
+        raise RuntimeError(
+            "Keine eingebetteten Bilder in der PDF gefunden. "
+            "Das PDF ist moeglicherweise kein einfacher Scan."
+        )
+    img = images[0]
+    name = (img.name or "").lower()
+    if "png" in name:
+        mime = "image/png"
+    elif "jp" in name:
+        mime = "image/jpeg"
+    else:
+        mime = "image/jpeg"
+    return base64.b64encode(img.data).decode(), mime
+
+def _extract_jsonld_recipe(html: str) -> str | None:
+    """JSON-LD Recipe-Daten aus HTML extrahieren (Standard bei vielen Rezeptseiten)."""
+    import re
+    scripts = re.findall(
+        r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    for script in scripts:
+        try:
+            data = json.loads(script.strip())
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            # Manchmal in @graph verschachtelt
+            if "@graph" in data:
+                for item in data["@graph"]:
+                    t = item.get("@type", "")
+                    if t == "Recipe" or (isinstance(t, list) and "Recipe" in t):
+                        data = item
+                        break
+            rtype = data.get("@type", "")
+            if rtype == "Recipe" or (isinstance(rtype, list) and "Recipe" in rtype):
+                return json.dumps(data, ensure_ascii=False, indent=2)
+        except Exception:
+            continue
+    return None
+
+
+class _TextExtractor:
+    from html.parser import HTMLParser as _HP
+
+    class _Inner(_HP):
+        _SKIP = {"script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"}
+
+        def __init__(self):
+            super().__init__()
+            self._depth = 0
+            self.parts: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in self._SKIP:
+                self._depth += 1
+
+        def handle_endtag(self, tag):
+            if tag in self._SKIP and self._depth > 0:
+                self._depth -= 1
+
+        def handle_data(self, data):
+            if not self._depth:
+                s = data.strip()
+                if s:
+                    self.parts.append(s)
+
+
+def _extract_text_from_html(html: str) -> str:
+    from html.parser import HTMLParser
+
+    class Extractor(HTMLParser):
+        SKIP = {"script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"}
+
+        def __init__(self):
+            super().__init__()
+            self._d = 0
+            self.parts: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag in self.SKIP:
+                self._d += 1
+
+        def handle_endtag(self, tag):
+            if tag in self.SKIP and self._d > 0:
+                self._d -= 1
+
+        def handle_data(self, data):
+            if not self._d:
+                s = data.strip()
+                if s:
+                    self.parts.append(s)
+
+    ex = Extractor()
+    try:
+        ex.feed(html)
+    except Exception:
+        pass
+    return "\n".join(ex.parts)

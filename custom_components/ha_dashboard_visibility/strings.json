@@ -2,12 +2,57 @@
   "config": {
     "step": {
       "user": {
-        "title": "Dashboard Visibility Manager einrichten",
-        "description": "Fügt eine Karte hinzu, mit der ein Admin pro Benutzer steuern kann, welche Dashboards in dessen Sidebar sichtbar sind. Es ist keine weitere Konfiguration nötig."
+        "title": "Rezepte Import einrichten",
+        "description": "Wähle den Konversationsagenten für Text-Analyse und den LLM-Vision-Anbieter für Bild-Analyse.",
+        "data": {
+          "conversation_agent": "Konversationsagent",
+          "llmvision_provider": "LLM Vision Anbieter (Fallback)",
+          "vision_api_key": "Groq API-Key (Bild-Import)",
+          "vision_model": "Groq Vision Modell",
+          "prompt_mode": "Text / Link Prompt",
+          "custom_prompt": "Eigener Prompt (Text / Link)",
+          "image_prompt_mode": "Bild-Prompt",
+          "custom_image_prompt": "Eigener Bild-Prompt"
+        },
+        "data_description": {
+          "conversation_agent": "Entity-ID des Konversationsagenten – wird für Text-, Link-, TXT- und PDF-Import verwendet. Beispiel: conversation.google_generative_ai",
+          "llmvision_provider": "Nur relevant wenn KEIN Groq API-Key eingetragen ist. Wird dann als Fallback für den Bild-Import verwendet. Hinweis: Bei Google und Groq als LLM Vision Anbieter gibt es einen bekannten Bug.",
+          "vision_api_key": "API-Key für Bild-Import und gescannte PDFs via Groq Vision API. Kostenlos unter console.groq.com. Wenn eingetragen, wird LLM Vision nicht verwendet.",
+          "vision_model": "Groq Vision Modell für den Bild-Import. Standard: meta-llama/llama-4-scout-17b-16e-instruct",
+          "prompt_mode": "Wähle Standard für die empfohlene Vorlage oder Eigener Prompt für eine individuelle Anweisung an die KI.",
+          "custom_prompt": "Individuelle Anweisung für Text-, Link- und TXT-Import. Der Rezepttext wird automatisch am Ende angehängt.",
+          "image_prompt_mode": "Wähle Standard für die empfohlene Vorlage oder Eigener Prompt für eine individuelle Anweisung an die KI.",
+          "custom_image_prompt": "Individuelle Anweisung für den Bild-Import. Das Bild wird direkt an die Vision API übergeben."
+        }
+      },
+      "reconfigure": {
+        "title": "Rezepte Import – Einstellungen anpassen",
+        "description": "Konversationsagent oder LLM Vision Anbieter aendern.",
+        "data": {
+          "conversation_agent": "Konversationsagent",
+          "llmvision_provider": "LLM Vision Anbieter (Fallback)",
+          "vision_api_key": "Groq API-Key (Bild-Import)",
+          "vision_model": "Groq Vision Modell",
+          "prompt_mode": "Text / Link Prompt",
+          "custom_prompt": "Eigener Prompt (Text / Link)",
+          "image_prompt_mode": "Bild-Prompt",
+          "custom_image_prompt": "Eigener Bild-Prompt"
+        },
+        "data_description": {
+          "conversation_agent": "Entity-ID des Konversationsagenten – wird für Text-, Link-, TXT- und PDF-Import verwendet. Beispiel: conversation.google_generative_ai",
+          "llmvision_provider": "Nur relevant wenn KEIN Groq API-Key eingetragen ist. Wird dann als Fallback für den Bild-Import verwendet. Hinweis: Bei Google und Groq als LLM Vision Anbieter gibt es einen bekannten Bug.",
+          "vision_api_key": "API-Key für Bild-Import und gescannte PDFs via Groq Vision API. Kostenlos unter console.groq.com. Wenn eingetragen, wird LLM Vision nicht verwendet.",
+          "vision_model": "Groq Vision Modell für den Bild-Import. Standard: meta-llama/llama-4-scout-17b-16e-instruct",
+          "prompt_mode": "Wähle Standard für die empfohlene Vorlage oder Eigener Prompt für eine individuelle Anweisung an die KI.",
+          "custom_prompt": "Individuelle Anweisung für Text-, Link- und TXT-Import. Der Rezepttext wird automatisch am Ende angehängt.",
+          "image_prompt_mode": "Wähle Standard für die empfohlene Vorlage oder Eigener Prompt für eine individuelle Anweisung an die KI.",
+          "custom_image_prompt": "Individuelle Anweisung für den Bild-Import. Das Bild wird direkt an die Vision API übergeben."
+        }
       }
     },
     "abort": {
-      "single_instance_allowed": "Es kann nur eine Instanz dieser Integration eingerichtet werden."
+      "already_configured": "Rezepte Import ist bereits eingerichtet.",
+      "reconfigure_successful": "Einstellungen wurden aktualisiert."
     }
   }
 }
