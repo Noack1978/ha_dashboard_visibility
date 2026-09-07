@@ -1,17 +1,13 @@
 {
-  "domain": "rezepte_import",
-  "name": "Rezepte Import",
-  "codeowners": [],
+  "domain": "ha_dashboard_visibility",
+  "name": "Dashboard Visibility Manager",
+  "codeowners": ["@Noack1978"],
   "config_flow": true,
-  "dependencies": [
-    "frontend",
-    "conversation"
-  ],
-  "documentation": "https://github.com/Noack1978/ha-rezepte-import",
-  "iot_class": "cloud_polling",
-  "requirements": [
-    "json-repair>=0.29.0",
-    "pypdf>=4.0.0"
-  ],
-  "version": "1.1.5"
+  "dependencies": ["http", "frontend"],
+  "documentation": "https://github.com/Noack1978/ha-dashboard-visibility",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/Noack1978/ha-dashboard-visibility/issues",
+  "requirements": [],
+  "version": "1.1.1"
 }
