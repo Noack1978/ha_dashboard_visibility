@@ -55,8 +55,22 @@ class DashboardVisibilityCard extends HTMLElement {
         </div>
       </ha-card>
       <style>
-        ha-card { padding-bottom: 8px; }
-        .card-content { overflow-x: auto; padding: 0 16px 16px; }
+        :host { display: block; height: 100%; }
+        ha-card {
+          height: 100%;
+          box-sizing: border-box;
+          padding-bottom: 8px;
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
+        }
+        .card-content {
+          flex: 1 1 auto;
+          min-height: 0;
+          overflow-y: auto;
+          overflow-x: auto;
+          padding: 0 16px 16px;
+        }
         table { border-collapse: collapse; width: 100%; }
         th, td { padding: 8px 12px; text-align: center; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
         th {
