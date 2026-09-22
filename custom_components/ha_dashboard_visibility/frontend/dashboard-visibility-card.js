@@ -59,7 +59,16 @@ class DashboardVisibilityCard extends HTMLElement {
         .card-content { overflow-x: auto; padding: 0 16px 16px; }
         table { border-collapse: collapse; width: 100%; }
         th, td { padding: 8px 12px; text-align: center; border-bottom: 1px solid var(--divider-color, #e0e0e0); }
-        th { font-weight: 500; color: var(--secondary-text-color); white-space: nowrap; }
+        th {
+          font-weight: 500;
+          color: var(--secondary-text-color);
+          white-space: nowrap;
+          position: sticky;
+          top: 0;
+          z-index: 2;
+          background-color: var(--card-background-color, var(--ha-card-background, white));
+          box-shadow: 0 1px 0 0 var(--divider-color, #e0e0e0);
+        }
         td.dashboard-name { text-align: left; white-space: nowrap; color: var(--primary-text-color); vertical-align: middle; }
         td.dashboard-name ha-icon { vertical-align: middle; }
         .name-block { display: inline-flex; flex-direction: column; vertical-align: middle; }
